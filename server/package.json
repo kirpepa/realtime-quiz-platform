@@ -5,6 +5,7 @@
   "type": "module",
   "description": "Backend for realtime quiz app (Express + Socket.IO + Prisma/SQLite)",
   "scripts": {
+    "postinstall": "prisma generate",
     "dev": "nodemon src/index.js",
     "start": "node src/index.js",
     "test": "node --test",

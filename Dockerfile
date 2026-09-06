@@ -11,7 +11,7 @@ FROM node:22-alpine AS server-deps
 WORKDIR /app/server
 COPY server/package.json server/package-lock.json ./
 COPY server/prisma ./prisma
-RUN npm ci && npm run prisma:generate && npm prune --omit=dev
+RUN npm ci && npm prune --omit=dev
 
 FROM node:22-alpine AS runtime
 ENV NODE_ENV=production \
