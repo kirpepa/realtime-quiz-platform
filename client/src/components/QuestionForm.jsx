@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { api, API_URL, assetUrl, tokenStore } from '../api/client.js';
+import { api, assetUrl } from '../api/client.js';
 
 const emptyOption = () => ({ text: '', isCorrect: false });
 
@@ -56,18 +56,27 @@ export default function QuestionForm({ quizId, question, onSaved, onCancel }) {
   async function handleImage(e) {
     const file = e.target.files?.[0];
     if (!file) return;
+    const allowedTypes = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+    if (!allowedTypes.includes(file.type)) {
+      setError('Выберите PNG, JPEG, WEBP или GIF');
+      e.target.value = '';
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      setError('Изображение должно быть не больше 5 МБ');
+      e.target.value = '';
+      return;
+    }
     setUploading(true);
     setError('');
     try {
       const form = new FormData();
       form.append('image', file);
-      const res = await fetch(`${API_URL}/api/quizzes/upload`, {
+      const data = await api('/api/quizzes/upload', {
         method: 'POST',
-        headers: { Authorization: `Bearer ${tokenStore.access}` },
         body: form,
+        isForm: true,
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Не удалось загрузить');
       setImageUrl(data.url);
     } catch (err) {
       setError(err.message);

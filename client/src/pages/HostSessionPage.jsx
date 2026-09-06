@@ -1,14 +1,15 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { getSocket, emitAck } from '../socket.js';
-import { tokenStore, assetUrl } from '../api/client.js';
+import { assetUrl, getSocketAccessToken } from '../api/client.js';
 import Timer from '../components/Timer.jsx';
 import Leaderboard from '../components/Leaderboard.jsx';
 
 export default function HostSessionPage() {
   const { sessionId } = useParams();
   const [phase, setPhase] = useState('connecting'); // connecting | lobby | question | reveal | finished
-  const [error, setError] = useState('');
+  const [fatalError, setFatalError] = useState('');
+  const [operationError, setOperationError] = useState('');
   const [roomCode, setRoomCode] = useState('');
   const [quizTitle, setQuizTitle] = useState('');
   const [participants, setParticipants] = useState([]);
@@ -16,23 +17,43 @@ export default function HostSessionPage() {
   const [progress, setProgress] = useState({ answered: 0, total: 0 });
   const [reveal, setReveal] = useState(null);
   const [leaderboard, setLeaderboard] = useState([]);
+  const [actionBusy, setActionBusy] = useState(false);
+  const openingRef = useRef(false);
 
   useEffect(() => {
     const socket = getSocket();
+    let active = true;
 
     async function open() {
-      const res = await emitAck('organizer:open', {
-        sessionId,
-        token: tokenStore.access,
-      });
-      if (res.error) {
-        setError(res.error);
+      if (openingRef.current) return;
+      openingRef.current = true;
+      const token = await getSocketAccessToken();
+      if (!active) {
+        openingRef.current = false;
         return;
       }
+      if (!token) {
+        setFatalError('Сессия авторизации истекла. Войдите снова.');
+        openingRef.current = false;
+        return;
+      }
+      const res = await emitAck('organizer:open', {
+        sessionId,
+        token,
+      });
+      openingRef.current = false;
+      if (!active) return;
+      if (res.error) {
+        setFatalError(res.error);
+        return;
+      }
+      setFatalError('');
+      setOperationError('');
       setRoomCode(res.roomCode);
       setQuizTitle(res.quizTitle);
       setParticipants(res.participants || []);
       setLeaderboard(res.leaderboard || []);
+      setProgress(res.progress || { answered: 0, total: 0 });
       if (res.currentQuestion) setQuestion(res.currentQuestion);
       if (res.status === 'reveal') {
         // Reconnected mid-reveal: restore the correct answers + leaderboard.
@@ -47,6 +68,7 @@ export default function HostSessionPage() {
 
     const onParticipants = (list) => setParticipants(list);
     const onShow = (q) => {
+      setOperationError('');
       setQuestion(q);
       setReveal(null);
       setProgress({ answered: 0, total: 0 });
@@ -62,42 +84,75 @@ export default function HostSessionPage() {
       setLeaderboard(data.leaderboard || []);
       setPhase('finished');
     };
+    const onGameError = ({ message }) => setOperationError(message || 'Ошибка сохранения игры');
+    const onReplaced = ({ message }) => setFatalError(message || 'Сессия открыта в другой вкладке');
+    const onShutdown = ({ message }) => setFatalError(message || 'Сервер перезапускается');
 
     socket.on('room:participants', onParticipants);
     socket.on('question:show', onShow);
     socket.on('question:progress', onProgress);
     socket.on('question:reveal', onReveal);
     socket.on('quiz:finish', onFinish);
+    socket.on('game:error', onGameError);
+    socket.on('session:replaced', onReplaced);
+    socket.on('server:shutdown', onShutdown);
     socket.on('connect', open);
-    open();
+    if (socket.connected) open();
 
     return () => {
+      active = false;
+      openingRef.current = false;
+      if (socket.connected) socket.emit('room:leave', { role: 'organizer', sessionId });
       socket.off('room:participants', onParticipants);
       socket.off('question:show', onShow);
       socket.off('question:progress', onProgress);
       socket.off('question:reveal', onReveal);
       socket.off('quiz:finish', onFinish);
+      socket.off('game:error', onGameError);
+      socket.off('session:replaced', onReplaced);
+      socket.off('server:shutdown', onShutdown);
       socket.off('connect', open);
     };
   }, [sessionId]);
 
   async function start() {
-    const res = await emitAck('quiz:start', {});
-    if (res.error) setError(res.error);
+    if (actionBusy) return;
+    setActionBusy(true);
+    setOperationError('');
+    try {
+      const res = await emitAck('quiz:start', {});
+      if (res.error) setOperationError(res.error);
+    } finally {
+      setActionBusy(false);
+    }
   }
   async function revealNow() {
-    const res = await emitAck('quiz:reveal', {});
-    if (res.error) setError(res.error);
+    if (actionBusy) return;
+    setActionBusy(true);
+    setOperationError('');
+    try {
+      const res = await emitAck('quiz:reveal', {});
+      if (res.error) setOperationError(res.error);
+    } finally {
+      setActionBusy(false);
+    }
   }
   async function next() {
-    const res = await emitAck('quiz:next', {});
-    if (res.error) setError(res.error);
+    if (actionBusy) return;
+    setActionBusy(true);
+    setOperationError('');
+    try {
+      const res = await emitAck('quiz:next', {});
+      if (res.error) setOperationError(res.error);
+    } finally {
+      setActionBusy(false);
+    }
   }
 
-  if (error) {
+  if (fatalError) {
     return (
       <div className="card">
-        <p className="text-red-600">{error}</p>
+        <p className="text-red-600">{fatalError}</p>
         <Link to="/dashboard" className="btn-secondary mt-4">
           ← В кабинет
         </Link>
@@ -106,9 +161,13 @@ export default function HostSessionPage() {
   }
 
   const joinUrl = `${window.location.origin}/join?code=${roomCode}`;
+  const connectedCount = participants.filter((participant) => participant.connected).length;
 
   return (
     <div className="space-y-6">
+      {operationError && (
+        <p className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{operationError}</p>
+      )}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-2xl font-bold">{quizTitle}</h1>
@@ -143,13 +202,17 @@ export default function HostSessionPage() {
         <div className="card space-y-4">
           <div className="flex items-center justify-between">
             <h2 className="text-lg font-semibold">
-              Подключились: {participants.length}
+              Подключились: {connectedCount}
             </h2>
-            <button className="btn-primary" onClick={start} disabled={participants.length === 0}>
+            <button
+              className="btn-primary"
+              onClick={start}
+              disabled={connectedCount === 0 || actionBusy}
+            >
               ▶ Начать квиз
             </button>
           </div>
-          {participants.length === 0 ? (
+          {connectedCount === 0 ? (
             <div className="flex flex-col items-center gap-2 py-8 text-center">
               <span className="relative flex h-3 w-3">
                 <span className="absolute inline-flex h-3 w-3 animate-ping rounded-full bg-brand-400 opacity-75" />
@@ -211,7 +274,7 @@ export default function HostSessionPage() {
               </div>
             ))}
           </div>
-          <button className="btn-secondary" onClick={revealNow}>
+          <button className="btn-secondary" onClick={revealNow} disabled={actionBusy}>
             Показать ответ сейчас
           </button>
         </div>
@@ -237,7 +300,7 @@ export default function HostSessionPage() {
                 </div>
               );
             })}
-            <button className="btn-primary w-full" onClick={next}>
+            <button className="btn-primary w-full" onClick={next} disabled={actionBusy}>
               {reveal.isLast ? '🏁 Завершить и показать итоги' : 'Следующий вопрос →'}
             </button>
           </div>

@@ -1,17 +1,27 @@
 import { useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate, Link } from 'react-router-dom';
 import { getSocket, emitAck } from '../socket.js';
-import { tokenStore, assetUrl } from '../api/client.js';
+import { assetUrl, getSocketAccessToken } from '../api/client.js';
 import Timer from '../components/Timer.jsx';
 import Leaderboard from '../components/Leaderboard.jsx';
 
 export default function PlayPage() {
   const location = useLocation();
   const navigate = useNavigate();
-  const { code, nickname } = location.state || {};
+  let storedJoin = null;
+  try {
+    storedJoin = JSON.parse(sessionStorage.getItem('active_quiz_join'));
+  } catch {
+    sessionStorage.removeItem('active_quiz_join');
+  }
+  const code = location.state?.code || storedJoin?.code;
+  const nickname = location.state?.nickname || storedJoin?.nickname;
 
   const [phase, setPhase] = useState('joining'); // joining | waiting | question | answered | reveal | finished
   const [error, setError] = useState('');
+  const [fatalError, setFatalError] = useState('');
+  const [connectionNote, setConnectionNote] = useState('');
+  const [submitting, setSubmitting] = useState(false);
   const [quizTitle, setQuizTitle] = useState('');
   const [question, setQuestion] = useState(null);
   const [selected, setSelected] = useState([]);
@@ -27,7 +37,9 @@ export default function PlayPage() {
       navigate('/join');
       return;
     }
+    sessionStorage.setItem('active_quiz_join', JSON.stringify({ code, nickname }));
     const socket = getSocket();
+    let active = true;
     const idKey = `participant_${code}`;
     const tokenKey = `rejoin_${code}`;
 
@@ -38,32 +50,50 @@ export default function PlayPage() {
       if (joiningRef.current) return;
       joiningRef.current = true;
       try {
+        const accessToken = await getSocketAccessToken();
+        if (!active) return;
         const res = await emitAck('room:join', {
           roomCode: code,
           nickname,
-          token: tokenStore.access,
+          token: accessToken,
           participantId: participantIdRef.current || localStorage.getItem(idKey),
           rejoinToken: rejoinTokenRef.current || localStorage.getItem(tokenKey),
         });
+        if (!active) return;
         if (res.error) {
-          setError(res.error);
+          if (participantIdRef.current) setConnectionNote(res.error);
+          else setFatalError(res.error);
           return;
         }
+        setFatalError('');
+        setConnectionNote('');
+        setError('');
         participantIdRef.current = res.participantId;
         rejoinTokenRef.current = res.rejoinToken;
         localStorage.setItem(idKey, res.participantId);
         if (res.rejoinToken) localStorage.setItem(tokenKey, res.rejoinToken);
         setQuizTitle(res.quizTitle);
         setLeaderboard(res.leaderboard || []);
+        setSelected(res.ownAnswer?.optionIds || []);
         if (res.status === 'reveal') {
           // Reconnected mid-reveal: restore the correct answers + leaderboard.
           if (res.currentQuestion) setQuestion(res.currentQuestion);
           setReveal(res.reveal || null);
+          if (res.ownAnswer?.correct !== undefined) {
+            setResult({
+              correct: res.ownAnswer.correct,
+              scoreAwarded: res.ownAnswer.scoreAwarded,
+              totalScore: res.ownAnswer.totalScore,
+            });
+          } else {
+            setResult(null);
+          }
           setPhase('reveal');
         } else if (res.currentQuestion) {
           setQuestion(res.currentQuestion);
-          setSelected([]);
-          setPhase('question');
+          setResult(null);
+          setReveal(null);
+          setPhase(res.ownAnswer ? 'answered' : 'question');
         } else if (res.status === 'finished') {
           setPhase('finished');
         } else {
@@ -75,6 +105,7 @@ export default function PlayPage() {
     }
 
     const onShow = (q) => {
+      setError('');
       setQuestion(q);
       setSelected([]);
       setResult(null);
@@ -94,29 +125,48 @@ export default function PlayPage() {
     const onFinish = (data) => {
       setLeaderboard(data.leaderboard || []);
       setPhase('finished');
+      sessionStorage.removeItem('active_quiz_join');
     };
+    const onGameError = ({ message }) => setError(message || 'Ошибка сохранения игры');
+    const onReplaced = ({ message }) => setFatalError(message || 'Сессия открыта в другой вкладке');
+    const onShutdown = ({ message }) => setFatalError(message || 'Сервер перезапускается');
+    const onDisconnect = () => setConnectionNote('Соединение потеряно, переподключаемся…');
 
-    // Only re-join on genuine reconnects (after we've already joined once).
-    // The very first connection is handled by the direct join() call below,
-    // so we avoid a duplicate join before participantId exists.
-    const onReconnect = () => {
-      if (participantIdRef.current) join();
-    };
+    // The same path handles both the first connection and later reconnects;
+    // joiningRef serializes overlapping React/socket lifecycle callbacks.
+    const onReconnect = () => join();
 
     socket.on('question:show', onShow);
     socket.on('question:answered_ack', onAck);
     socket.on('question:result', onResult);
     socket.on('question:reveal', onReveal);
     socket.on('quiz:finish', onFinish);
+    socket.on('game:error', onGameError);
+    socket.on('session:replaced', onReplaced);
+    socket.on('server:shutdown', onShutdown);
+    socket.on('disconnect', onDisconnect);
     socket.on('connect', onReconnect);
-    join();
+    if (socket.connected) join();
 
     return () => {
+      active = false;
+      joiningRef.current = false;
+      if (socket.connected) {
+        socket.emit('room:leave', {
+          role: 'participant',
+          roomCode: code,
+          participantId: participantIdRef.current,
+        });
+      }
       socket.off('question:show', onShow);
       socket.off('question:answered_ack', onAck);
       socket.off('question:result', onResult);
       socket.off('question:reveal', onReveal);
       socket.off('quiz:finish', onFinish);
+      socket.off('game:error', onGameError);
+      socket.off('session:replaced', onReplaced);
+      socket.off('server:shutdown', onShutdown);
+      socket.off('disconnect', onDisconnect);
       socket.off('connect', onReconnect);
     };
   }, [code, nickname, navigate]);
@@ -133,19 +183,25 @@ export default function PlayPage() {
   }
 
   async function submit() {
+    if (submitting) return;
+    setSubmitting(true);
     setError('');
-    const res = await emitAck('question:answer', { optionIds: selected });
-    if (res.error) setError(res.error);
-    // Success path is confirmed by the question:answered_ack event.
+    try {
+      const res = await emitAck('question:answer', { optionIds: selected });
+      if (res.error) setError(res.error);
+      // Success path is confirmed by the question:answered_ack event.
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   const myEntry = leaderboard.find((e) => e.participantId === participantIdRef.current);
   const myRank = myEntry ? leaderboard.indexOf(myEntry) + 1 : null;
 
-  if (error && phase === 'joining') {
+  if (fatalError) {
     return (
       <div className="mx-auto max-w-md card text-center">
-        <p className="text-red-600">{error}</p>
+        <p className="text-red-600">{fatalError}</p>
         <Link to="/join" className="btn-secondary mt-4">
           ← Назад
         </Link>
@@ -155,6 +211,14 @@ export default function PlayPage() {
 
   return (
     <div className="mx-auto max-w-lg space-y-4">
+      {connectionNote && (
+        <p className="rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-800">
+          {connectionNote}
+        </p>
+      )}
+      {error && phase !== 'question' && phase !== 'answered' && (
+        <p className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>
+      )}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-xl font-bold">{quizTitle || 'Квиз'}</h1>
@@ -233,8 +297,12 @@ export default function PlayPage() {
           </div>
           {error && <p className="text-sm text-red-600">{error}</p>}
           {phase === 'question' ? (
-            <button className="btn-primary w-full" onClick={submit} disabled={selected.length === 0}>
-              Ответить
+            <button
+              className="btn-primary w-full"
+              onClick={submit}
+              disabled={selected.length === 0 || submitting}
+            >
+              {submitting ? 'Отправляем…' : 'Ответить'}
             </button>
           ) : (
             <p className="text-center text-sm font-medium text-green-600">

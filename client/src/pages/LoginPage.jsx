@@ -51,6 +51,7 @@ export default function LoginPage() {
               className="input"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
+              maxLength={72}
               required
             />
           </div>

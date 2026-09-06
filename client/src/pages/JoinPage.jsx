@@ -69,6 +69,7 @@ export default function JoinPage() {
               className="input"
               value={nickname}
               onChange={(e) => setNickname(e.target.value)}
+              maxLength={40}
               placeholder="Например, Аня"
               required
             />

@@ -1,27 +1,25 @@
 import { nanoid } from 'nanoid';
+import { config } from '../config.js';
 import { prisma } from '../db.js';
 import { verifyAccessToken } from '../auth/jwt.js';
 import { isAnswerCorrect, computeScore } from '../lib/scoring.js';
 
-// In-memory state for every live room, keyed by roomCode. Holds the state of an
-// in-progress session; results are persisted to the DB at reveal time.
+// Realtime state is deliberately process-local. Persisted answers and scores
+// remain authoritative; a deployment therefore runs one application replica.
 const liveRooms = new Map();
 
-// ----- helpers ---------------------------------------------------------------
-
 function publicQuestion(room) {
-  const q = room.currentQuestion;
-  if (!q) return null;
+  const question = room.currentQuestion;
+  if (!question) return null;
   return {
-    id: q.id,
+    id: question.id,
     index: room.currentIndex,
     total: room.quiz.questions.length,
-    type: q.type,
-    answerType: q.answerType,
-    text: q.text,
-    imageUrl: q.imageUrl,
-    // Options without the isCorrect flag — clients must never see the answer.
-    options: q.options.map((o) => ({ id: o.id, text: o.text })),
+    type: question.type,
+    answerType: question.answerType,
+    text: question.text,
+    imageUrl: question.imageUrl,
+    options: question.options.map((option) => ({ id: option.id, text: option.text })),
     timeLimitMs: room.questionTimeLimitMs,
     endsAt: room.questionEndsAt,
     serverNow: Date.now(),
@@ -30,312 +28,487 @@ function publicQuestion(room) {
 
 function leaderboard(room) {
   return [...room.participants.values()]
-    .map((p) => ({
-      participantId: p.id,
-      nickname: p.nickname,
-      score: p.score,
-      connected: p.connected,
+    .map((participant) => ({
+      participantId: participant.id,
+      nickname: participant.nickname,
+      score: participant.score,
+      connected: participant.connected,
     }))
-    .sort((a, b) => b.score - a.score);
+    .sort((a, b) => b.score - a.score || a.nickname.localeCompare(b.nickname));
 }
 
 function participantList(room) {
-  return [...room.participants.values()].map((p) => ({
-    participantId: p.id,
-    nickname: p.nickname,
-    connected: p.connected,
-    score: p.score,
+  return [...room.participants.values()].map((participant) => ({
+    participantId: participant.id,
+    nickname: participant.nickname,
+    connected: participant.connected,
+    score: participant.score,
   }));
 }
 
 function questionTimeLimit(room, question) {
-  const seconds = question.timeLimit || room.quiz.defaultTimePerQuestion || 20;
-  return seconds * 1000;
+  return (question.timeLimit || room.quiz.defaultTimePerQuestion || 20) * 1000;
 }
 
-// ----- lifecycle -------------------------------------------------------------
+function onAsync(socket, event, handler) {
+  socket.on(event, (payload = {}, callback) => {
+    const ack = typeof callback === 'function' ? callback : () => {};
+    socket.data.pendingEvents ||= new Set();
+    if (socket.data.pendingEvents.has(event)) {
+      ack({ error: 'Предыдущая операция этого типа ещё выполняется' });
+      return;
+    }
+    socket.data.pendingEvents.add(event);
+    Promise.resolve(handler(payload && typeof payload === 'object' ? payload : {}, ack))
+      .catch((error) => {
+        console.error(`Socket event ${event} failed:`, error);
+        ack({ error: 'Внутренняя ошибка сервера' });
+      })
+      .finally(() => socket.data.pendingEvents.delete(event));
+  });
+}
+
+function consumeEventQuota(socket, key, limit, windowMs) {
+  socket.data.eventQuotas ||= new Map();
+  const now = Date.now();
+  const current = socket.data.eventQuotas.get(key);
+  if (!current || current.resetAt <= now) {
+    socket.data.eventQuotas.set(key, { count: 1, resetAt: now + windowMs });
+    return true;
+  }
+  current.count += 1;
+  return current.count <= limit;
+}
+
+function getOrganizerRoom(socket) {
+  if (socket.data?.role !== 'organizer') return null;
+  const room = liveRooms.get(socket.data.roomCode);
+  return room?.organizerSocketId === socket.id ? room : null;
+}
+
+function detachSocket(io, socket, notify = true) {
+  const { role, roomCode, participantId } = socket.data || {};
+  const room = liveRooms.get(roomCode);
+  if (!room) return;
+
+  if (role === 'participant' && participantId) {
+    const participant = room.participants.get(participantId);
+    // A stale, replaced socket must not mark the new connection offline.
+    if (participant?.socketId === socket.id) {
+      participant.connected = false;
+      participant.socketId = null;
+      if (notify) io.to(room.roomCode).emit('room:participants', participantList(room));
+    }
+  }
+  if (role === 'organizer' && room.organizerSocketId === socket.id) {
+    room.organizerSocketId = null;
+  }
+  socket.leave(roomCode);
+  delete socket.data.role;
+  delete socket.data.roomCode;
+  delete socket.data.participantId;
+  delete socket.data.userId;
+}
+
+function replaceSocket(io, socketId) {
+  if (!socketId) return;
+  const oldSocket = io.sockets.sockets.get(socketId);
+  if (!oldSocket) return;
+  oldSocket.emit('session:replaced', {
+    message: 'Эта игровая сессия открыта в другой вкладке или на другом устройстве',
+  });
+  detachSocket(io, oldSocket);
+}
+
+function cleanNickname(value) {
+  if (typeof value !== 'string') return '';
+  return value.trim().replace(/\s+/g, ' ').slice(0, 40);
+}
+
+function ownAnswer(room, participant) {
+  const answer = room.answers.get(participant.id);
+  if (!answer) return null;
+  return {
+    optionIds: answer.optionIds,
+    ...(room.status === 'reveal'
+      ? {
+          correct: answer.correct,
+          scoreAwarded: answer.score,
+          totalScore: participant.score,
+        }
+      : {}),
+  };
+}
 
 export function initSockets(io) {
   io.on('connection', (socket) => {
-    // ---- organizer opens/hosts a session -----------------------------------
-    socket.on('organizer:open', async ({ sessionId, token }, cb) => {
+    onAsync(socket, 'organizer:open', async ({ sessionId, token }, ack) => {
+      if (!consumeEventQuota(socket, 'organizer:open', 12, 60_000)) {
+        return ack({ error: 'Слишком много попыток открыть сессию' });
+      }
+      if (typeof sessionId !== 'string' || typeof token !== 'string') {
+        return ack({ error: 'Требуется авторизация организатора' });
+      }
+
+      let user;
       try {
-        const user = verifyAccessToken(token);
-        const session = await prisma.quizSession.findUnique({
-          where: { id: sessionId },
-          include: {
-            quiz: {
-              include: {
-                questions: {
-                  orderBy: { orderIndex: 'asc' },
-                  include: { options: { orderBy: { orderIndex: 'asc' } } },
-                },
+        user = verifyAccessToken(token);
+      } catch {
+        return ack({ error: 'Недействительный или истёкший токен' });
+      }
+
+      const session = await prisma.quizSession.findUnique({
+        where: { id: sessionId },
+        include: {
+          quiz: {
+            include: {
+              questions: {
+                orderBy: { orderIndex: 'asc' },
+                include: { options: { orderBy: { orderIndex: 'asc' } } },
               },
             },
           },
-        });
-        if (!session) return cb?.({ error: 'Сессия не найдена' });
-        if (session.quiz.ownerId !== user.id) {
-          return cb?.({ error: 'Это не ваша сессия' });
-        }
-        if (session.status === 'finished') {
-          return cb?.({ error: 'Сессия уже завершена' });
-        }
+        },
+      });
+      if (!session) return ack({ error: 'Сессия не найдена' });
+      if (session.quiz.ownerId !== user.id) return ack({ error: 'Это не ваша сессия' });
+      if (session.status === 'finished') return ack({ error: 'Сессия уже завершена' });
 
-        let room = liveRooms.get(session.roomCode);
-        if (!room) {
-          room = {
-            roomCode: session.roomCode,
-            sessionId: session.id,
-            quiz: session.quiz,
-            status: 'lobby', // lobby | question | reveal | finished
-            organizerSocketId: socket.id,
-            participants: new Map(),
-            currentIndex: -1,
-            currentQuestion: null,
-            questionEndsAt: null,
-            questionTimeLimitMs: null,
-            timer: null,
-            answers: new Map(), // participantId -> { optionIds, correct, score }
-            lastReveal: null, // cached reveal payload for mid-reveal reconnects
-          };
-          liveRooms.set(session.roomCode, room);
-        } else {
-          room.organizerSocketId = socket.id;
-        }
-
-        socket.data = { role: 'organizer', roomCode: session.roomCode, userId: user.id };
-        socket.join(session.roomCode);
-
-        cb?.({
-          ok: true,
-          roomCode: session.roomCode,
-          quizTitle: session.quiz.title,
-          status: room.status,
-          participants: participantList(room),
-          currentQuestion:
-            room.status === 'question' || room.status === 'reveal' ? publicQuestion(room) : null,
-          reveal: room.status === 'reveal' ? room.lastReveal : null,
-          leaderboard: leaderboard(room),
-        });
-      } catch {
-        cb?.({ error: 'Недействительный токен' });
-      }
-    });
-
-    // ---- participant joins a room ------------------------------------------
-    socket.on('room:join', async ({ roomCode, nickname, token, participantId, rejoinToken }, cb) => {
-      const code = (roomCode || '').toUpperCase();
-      const room = liveRooms.get(code);
-      const dbSession = await prisma.quizSession.findUnique({ where: { roomCode: code } });
-      if (!dbSession) return cb?.({ error: 'Комната не найдена' });
-      if (dbSession.status === 'finished' || room?.status === 'finished') {
-        return cb?.({ error: 'Квиз уже завершён' });
-      }
+      let room = liveRooms.get(session.roomCode);
       if (!room) {
-        return cb?.({ error: 'Организатор ещё не открыл комнату' });
-      }
-
-      let userId = null;
-      if (token) {
-        try {
-          userId = verifyAccessToken(token).id;
-        } catch {
-          // Guest fallback if the token is invalid.
-        }
-      }
-
-      // Resolve the participant. Reconnecting to an existing entry is only
-      // allowed if the caller proves ownership — either a matching rejoinToken
-      // (issued on first join) or the same authenticated userId. This prevents
-      // hijacking another player by guessing their (broadcast) participantId.
-      let participant = null;
-      if (participantId) {
-        const existing = room.participants.get(participantId);
-        if (
-          existing &&
-          ((rejoinToken && existing.rejoinToken === rejoinToken) ||
-            (userId && existing.userId === userId))
-        ) {
-          participant = existing;
-        }
-      }
-      // Dedup: a logged-in user always maps to a single participant per session,
-      // even if they refreshed and lost their participantId/rejoinToken.
-      if (!participant && userId) {
-        participant =
-          [...room.participants.values()].find((p) => p.userId === userId) || null;
-      }
-
-      if (participant) {
-        participant.socketId = socket.id;
-        participant.connected = true;
-      } else {
-        const nick = (nickname || '').trim();
-        if (!nick) return cb?.({ error: 'Введите никнейм' });
-        const dbParticipant = await prisma.sessionParticipant.create({
-          data: { sessionId: room.sessionId, userId, nickname: nick },
-        });
-        participant = {
-          id: dbParticipant.id,
-          nickname: nick,
-          userId,
-          socketId: socket.id,
-          score: 0,
-          connected: true,
-          rejoinToken: nanoid(), // secret proof for future reconnects
+        room = {
+          roomCode: session.roomCode,
+          sessionId: session.id,
+          quiz: session.quiz,
+          status: 'lobby',
+          organizerSocketId: null,
+          participants: new Map(),
+          currentIndex: -1,
+          currentQuestion: null,
+          questionEndsAt: null,
+          questionTimeLimitMs: null,
+          timer: null,
+          cleanupTimer: null,
+          answers: new Map(),
+          lastReveal: null,
+          transitioning: false,
+          revealRetryCount: 0,
         };
-        room.participants.set(participant.id, participant);
+        liveRooms.set(session.roomCode, room);
       }
 
-      socket.data = { role: 'participant', roomCode: code, participantId: participant.id };
-      socket.join(code);
+      if (room.sessionId !== session.id) return ack({ error: 'Конфликт состояния комнаты' });
+      if (room.organizerSocketId && room.organizerSocketId !== socket.id) {
+        replaceSocket(io, room.organizerSocketId);
+      }
+      if (
+        socket.data.role &&
+        (socket.data.role !== 'organizer' || socket.data.roomCode !== room.roomCode)
+      ) {
+        detachSocket(io, socket);
+      }
 
-      // Tell the joiner the current state (so a late/reconnecting player syncs).
-      cb?.({
+      room.organizerSocketId = socket.id;
+      Object.assign(socket.data, {
+        role: 'organizer',
+        roomCode: session.roomCode,
+        userId: user.id,
+      });
+      socket.join(session.roomCode);
+
+      ack({
         ok: true,
-        participantId: participant.id,
-        rejoinToken: participant.rejoinToken,
-        nickname: participant.nickname,
+        roomCode: session.roomCode,
+        quizTitle: session.quiz.title,
         status: room.status,
-        quizTitle: room.quiz.title,
+        participants: participantList(room),
         currentQuestion:
           room.status === 'question' || room.status === 'reveal' ? publicQuestion(room) : null,
         reveal: room.status === 'reveal' ? room.lastReveal : null,
         leaderboard: leaderboard(room),
+        progress: {
+          answered: room.answers.size,
+          total: [...room.participants.values()].filter((p) => p.connected).length,
+        },
       });
+    });
 
-      // If reconnecting mid-question and they already answered, let them know.
-      if (room.status === 'question' && room.answers.has(participant.id)) {
-        socket.emit('question:answered_ack', {
-          optionIds: room.answers.get(participant.id).optionIds,
+    onAsync(
+      socket,
+      'room:join',
+      async ({ roomCode, nickname, token, participantId, rejoinToken }, ack) => {
+        if (!consumeEventQuota(socket, 'room:join', 10, 60_000)) {
+          return ack({ error: 'Слишком много попыток входа в комнату' });
+        }
+        const code = typeof roomCode === 'string' ? roomCode.trim().toUpperCase() : '';
+        if (!/^[A-HJ-NP-Z2-9]{6}$/.test(code)) {
+          return ack({ error: 'Некорректный код комнаты' });
+        }
+
+        const room = liveRooms.get(code);
+        const dbSession = await prisma.quizSession.findUnique({ where: { roomCode: code } });
+        if (!dbSession) return ack({ error: 'Комната не найдена' });
+        if (dbSession.status === 'finished' || room?.status === 'finished') {
+          return ack({ error: 'Квиз уже завершён' });
+        }
+        if (!room) return ack({ error: 'Организатор ещё не открыл комнату' });
+
+        let userId = null;
+        if (token !== undefined && token !== null && token !== '') {
+          if (typeof token !== 'string') return ack({ error: 'Недействительный токен' });
+          try {
+            const decoded = verifyAccessToken(token);
+            const user = await prisma.user.findUnique({
+              where: { id: decoded.id },
+              select: { id: true },
+            });
+            if (!user) return ack({ error: 'Пользователь не найден' });
+            userId = user.id;
+          } catch {
+            return ack({ error: 'Недействительный или истёкший токен' });
+          }
+        }
+
+        let participant = null;
+        if (socket.data.role === 'participant' && socket.data.roomCode === code) {
+          const bound = room.participants.get(socket.data.participantId);
+          if (bound?.socketId === socket.id) participant = bound;
+        }
+        if (typeof participantId === 'string') {
+          const existing = room.participants.get(participantId);
+          if (
+            existing &&
+            ((typeof rejoinToken === 'string' && existing.rejoinToken === rejoinToken) ||
+              (userId && existing.userId === userId))
+          ) {
+            participant = existing;
+          }
+        }
+        if (!participant && userId) {
+          participant = [...room.participants.values()].find((p) => p.userId === userId) || null;
+        }
+
+        if (!participant) {
+          if (room.participants.size >= config.maxParticipantsPerRoom) {
+            return ack({ error: 'Комната заполнена' });
+          }
+          const cleanNick = cleanNickname(nickname);
+          if (!cleanNick) return ack({ error: 'Введите никнейм' });
+
+          let dbParticipant;
+          if (userId) {
+            dbParticipant = await prisma.sessionParticipant.upsert({
+              where: { sessionId_userId: { sessionId: room.sessionId, userId } },
+              create: { sessionId: room.sessionId, userId, nickname: cleanNick },
+              update: {},
+            });
+            participant = room.participants.get(dbParticipant.id) || null;
+          } else {
+            dbParticipant = await prisma.sessionParticipant.create({
+              data: { sessionId: room.sessionId, nickname: cleanNick },
+            });
+          }
+
+          if (!participant) {
+            participant = {
+              id: dbParticipant.id,
+              nickname: dbParticipant.nickname,
+              userId,
+              socketId: null,
+              score: dbParticipant.score,
+              connected: false,
+              rejoinToken: nanoid(32),
+            };
+            room.participants.set(participant.id, participant);
+          }
+        }
+
+        if (participant.socketId && participant.socketId !== socket.id) {
+          replaceSocket(io, participant.socketId);
+        }
+        if (
+          socket.data.role &&
+          (socket.data.role !== 'participant' ||
+            socket.data.roomCode !== code ||
+            socket.data.participantId !== participant.id)
+        ) {
+          detachSocket(io, socket);
+        }
+
+        participant.socketId = socket.id;
+        participant.connected = true;
+        Object.assign(socket.data, {
+          role: 'participant',
+          roomCode: code,
+          participantId: participant.id,
+          userId,
         });
-      }
+        socket.join(code);
 
-      io.to(room.roomCode).emit('room:participants', participantList(room));
+        const answer = ownAnswer(room, participant);
+        ack({
+          ok: true,
+          participantId: participant.id,
+          rejoinToken: participant.rejoinToken,
+          nickname: participant.nickname,
+          status: room.status,
+          quizTitle: room.quiz.title,
+          currentQuestion:
+            room.status === 'question' || room.status === 'reveal' ? publicQuestion(room) : null,
+          reveal: room.status === 'reveal' ? room.lastReveal : null,
+          leaderboard: leaderboard(room),
+          ownAnswer: answer,
+        });
+
+        if (room.status === 'question' && answer) {
+          socket.emit('question:answered_ack', { optionIds: answer.optionIds });
+        }
+        io.to(room.roomCode).emit('room:participants', participantList(room));
+      }
+    );
+
+    onAsync(socket, 'room:leave', async ({ role, roomCode, participantId, sessionId }, ack) => {
+      const currentRoom = liveRooms.get(socket.data?.roomCode);
+      const matchesParticipant =
+        role === 'participant' &&
+        socket.data?.role === 'participant' &&
+        socket.data?.roomCode === roomCode &&
+        socket.data?.participantId === participantId;
+      const matchesOrganizer =
+        role === 'organizer' &&
+        socket.data?.role === 'organizer' &&
+        currentRoom?.sessionId === sessionId;
+      if (matchesParticipant || matchesOrganizer) detachSocket(io, socket);
+      ack({ ok: true });
     });
 
-    // ---- organizer starts the quiz ----------------------------------------
-    socket.on('quiz:start', async (_payload, cb) => {
+    onAsync(socket, 'quiz:start', async (_payload, ack) => {
       const room = getOrganizerRoom(socket);
-      if (!room) return cb?.({ error: 'Нет активной сессии' });
-      if (room.status !== 'lobby') return cb?.({ error: 'Квиз уже запущен' });
-      if (room.participants.size === 0) {
-        return cb?.({ error: 'Нет подключённых участников' });
+      if (!room) return ack({ error: 'Нет активной сессии' });
+      if (room.transitioning) return ack({ error: 'Предыдущая операция ещё выполняется' });
+      if (room.status !== 'lobby') return ack({ error: 'Квиз уже запущен' });
+      if (![...room.participants.values()].some((participant) => participant.connected)) {
+        return ack({ error: 'Нет подключённых участников' });
       }
-      await prisma.quizSession.update({
-        where: { id: room.sessionId },
-        data: { status: 'active', startedAt: new Date() },
-      });
-      showQuestion(io, room, 0);
-      cb?.({ ok: true });
+
+      room.transitioning = true;
+      try {
+        await prisma.quizSession.update({
+          where: { id: room.sessionId },
+          data: { status: 'active', startedAt: new Date() },
+        });
+        showQuestion(io, room, 0);
+        ack({ ok: true });
+      } finally {
+        room.transitioning = false;
+      }
     });
 
-    // ---- organizer advances to the next question / finishes ----------------
-    socket.on('quiz:next', async (_payload, cb) => {
+    onAsync(socket, 'quiz:next', async (_payload, ack) => {
       const room = getOrganizerRoom(socket);
-      if (!room) return cb?.({ error: 'Нет активной сессии' });
+      if (!room) return ack({ error: 'Нет активной сессии' });
+      if (room.transitioning) return ack({ error: 'Предыдущая операция ещё выполняется' });
       if (room.status !== 'reveal') {
-        return cb?.({ error: 'Дождитесь показа ответа перед переходом дальше' });
+        return ack({ error: 'Дождитесь показа ответа перед переходом дальше' });
       }
       const nextIndex = room.currentIndex + 1;
       if (nextIndex >= room.quiz.questions.length) {
-        await finishQuiz(io, room);
-      } else {
-        showQuestion(io, room, nextIndex);
+        const result = await finishQuiz(io, room);
+        return ack(result);
       }
-      cb?.({ ok: true });
+      showQuestion(io, room, nextIndex);
+      ack({ ok: true });
     });
 
-    // ---- organizer forces reveal (skip remaining time) ---------------------
-    socket.on('quiz:reveal', async (_payload, cb) => {
+    onAsync(socket, 'quiz:reveal', async (_payload, ack) => {
       const room = getOrganizerRoom(socket);
-      if (!room) return cb?.({ error: 'Нет активной сессии' });
-      if (room.status !== 'question') return cb?.({ error: 'Сейчас нет активного вопроса' });
-      await revealQuestion(io, room);
-      cb?.({ ok: true });
+      if (!room) return ack({ error: 'Нет активной сессии' });
+      if (room.status !== 'question') return ack({ error: 'Сейчас нет активного вопроса' });
+      const result = await revealQuestion(io, room);
+      ack(result);
     });
 
-    // ---- participant submits an answer -------------------------------------
-    socket.on('question:answer', async ({ optionIds }, cb) => {
+    onAsync(socket, 'question:answer', async ({ optionIds }, ack) => {
+      if (!consumeEventQuota(socket, 'question:answer', 30, 10_000)) {
+        return ack({ error: 'Слишком много попыток ответа' });
+      }
       const room = liveRooms.get(socket.data?.roomCode);
       const participantId = socket.data?.participantId;
-      if (!room || !participantId) return cb?.({ error: 'Вы не в комнате' });
-      if (room.status !== 'question') {
-        return cb?.({ error: 'Сейчас нельзя отвечать' });
+      const participant = room?.participants.get(participantId);
+      if (!room || !participantId || participant?.socketId !== socket.id) {
+        return ack({ error: 'Вы не в комнате' });
       }
-      // Server-authoritative timer: reject answers past the deadline.
-      if (Date.now() > room.questionEndsAt) {
-        return cb?.({ error: 'Время на ответ истекло' });
-      }
-      const already = room.answers.has(participantId);
-      if (already && !room.quiz.allowAnswerChange) {
-        return cb?.({ error: 'Изменение ответа запрещено' });
+      if (room.status !== 'question') return ack({ error: 'Сейчас нельзя отвечать' });
+      if (room.transitioning) return ack({ error: 'Результаты уже сохраняются' });
+      if (Date.now() > room.questionEndsAt) return ack({ error: 'Время на ответ истекло' });
+      if (room.answers.has(participantId) && !room.quiz.allowAnswerChange) {
+        return ack({ error: 'Изменение ответа запрещено' });
       }
 
-      const selected = Array.isArray(optionIds) ? optionIds : [];
-      const q = room.currentQuestion;
-      const validIds = new Set(q.options.map((o) => o.id));
-      const cleanSelected = selected.filter((id) => validIds.has(id));
-      if (cleanSelected.length === 0) return cb?.({ error: 'Выберите вариант ответа' });
-      if (q.answerType === 'single' && cleanSelected.length > 1) {
-        return cb?.({ error: 'Можно выбрать только один вариант' });
+      if (!Array.isArray(optionIds) || optionIds.length > 6) {
+        return ack({ error: 'Некорректный список ответов' });
+      }
+      const selected = [...new Set(optionIds)];
+      if (selected.some((id) => typeof id !== 'string')) {
+        return ack({ error: 'Некорректный список ответов' });
+      }
+      const question = room.currentQuestion;
+      const validIds = new Set(question.options.map((option) => option.id));
+      if (selected.length === 0) return ack({ error: 'Выберите вариант ответа' });
+      if (selected.some((id) => !validIds.has(id))) {
+        return ack({ error: 'Ответ содержит неизвестный вариант' });
+      }
+      if (question.answerType === 'single' && selected.length !== 1) {
+        return ack({ error: 'Можно выбрать только один вариант' });
       }
 
-      const correctIds = q.options.filter((o) => o.isCorrect).map((o) => o.id);
-      const correct = isAnswerCorrect(correctIds, cleanSelected);
-      const timeLeftMs = room.questionEndsAt - Date.now();
+      const correctIds = question.options
+        .filter((option) => option.isCorrect)
+        .map((option) => option.id);
+      const correct = isAnswerCorrect(correctIds, selected);
       const score = computeScore({
         correct,
         speedBonus: room.quiz.speedBonus,
-        timeLeftMs,
+        timeLeftMs: room.questionEndsAt - Date.now(),
         timeLimitMs: room.questionTimeLimitMs,
       });
 
-      room.answers.set(participantId, { optionIds: cleanSelected, correct, score });
-      cb?.({ ok: true });
-      socket.emit('question:answered_ack', { optionIds: cleanSelected });
+      room.answers.set(participantId, { optionIds: selected, correct, score });
+      ack({ ok: true });
+      socket.emit('question:answered_ack', { optionIds: selected });
 
-      // Update organizer with live answer progress.
       io.to(room.organizerSocketId).emit('question:progress', {
         answered: room.answers.size,
         total: [...room.participants.values()].filter((p) => p.connected).length,
       });
 
-      // Auto-reveal once every connected participant has answered — but only
-      // when answers are final. If the quiz allows changing answers, we must
-      // keep the window open until the timer (or the organizer) ends it.
-      if (!room.quiz.allowAnswerChange) {
-        const connected = [...room.participants.values()].filter((p) => p.connected);
-        if (connected.length > 0 && connected.every((p) => room.answers.has(p.id))) {
-          await revealQuestion(io, room);
-        }
+      if (!room.quiz.allowAnswerChange && allConnectedAnswered(room)) {
+        await revealQuestion(io, room);
       }
     });
 
-    // ---- disconnect --------------------------------------------------------
     socket.on('disconnect', () => {
-      const { role, roomCode, participantId } = socket.data || {};
-      const room = liveRooms.get(roomCode);
-      if (!room) return;
-      if (role === 'participant' && participantId) {
-        const p = room.participants.get(participantId);
-        if (p) {
-          p.connected = false;
-          io.to(room.roomCode).emit('room:participants', participantList(room));
-        }
+      const room = liveRooms.get(socket.data?.roomCode);
+      detachSocket(io, socket);
+      if (
+        room?.status === 'question' &&
+        !room.quiz.allowAnswerChange &&
+        !room.transitioning &&
+        allConnectedAnswered(room)
+      ) {
+        void revealQuestion(io, room).catch((error) => {
+          console.error(`Auto-reveal failed for room ${room.roomCode}:`, error);
+        });
       }
-      // Organizer disconnect keeps the room alive so they can reopen it.
     });
   });
 }
 
-function getOrganizerRoom(socket) {
-  if (socket.data?.role !== 'organizer') return null;
-  return liveRooms.get(socket.data.roomCode) || null;
+function allConnectedAnswered(room) {
+  const connected = [...room.participants.values()].filter((participant) => participant.connected);
+  return connected.length > 0 && connected.every((participant) => room.answers.has(participant.id));
 }
 
-// Shows question at `index`, starts the server-side deadline timer.
 function showQuestion(io, room, index) {
   if (room.timer) clearTimeout(room.timer);
   const question = room.quiz.questions[index];
@@ -343,107 +516,181 @@ function showQuestion(io, room, index) {
   room.currentIndex = index;
   room.currentQuestion = question;
   room.answers = new Map();
+  room.lastReveal = null;
+  room.revealRetryCount = 0;
   room.questionTimeLimitMs = questionTimeLimit(room, question);
   room.questionEndsAt = Date.now() + room.questionTimeLimitMs;
 
   io.to(room.roomCode).emit('question:show', publicQuestion(room));
   io.to(room.organizerSocketId).emit('question:progress', {
     answered: 0,
-    total: [...room.participants.values()].filter((p) => p.connected).length,
+    total: [...room.participants.values()].filter((participant) => participant.connected).length,
   });
 
-  // Authoritative deadline: auto-reveal when time is up.
   room.timer = setTimeout(() => {
-    revealQuestion(io, room).catch(() => {});
-  }, room.questionTimeLimitMs + 200); // small grace for in-flight packets
+    void timedReveal(io, room).catch((error) => {
+      console.error(`Timed reveal failed for room ${room.roomCode}:`, error);
+    });
+  }, room.questionTimeLimitMs + 200);
+  room.timer.unref?.();
 }
 
-// Persists answers, updates scores, and broadcasts the correct answer + board.
+async function timedReveal(io, room) {
+  const result = await revealQuestion(io, room);
+  if (result.error && room.status === 'question' && room.revealRetryCount < 3) {
+    room.revealRetryCount += 1;
+    room.timer = setTimeout(() => {
+      void timedReveal(io, room).catch((error) => {
+        console.error(`Timed reveal retry failed for room ${room.roomCode}:`, error);
+      });
+    }, 2_000);
+    room.timer.unref?.();
+  }
+}
+
 async function revealQuestion(io, room) {
-  if (room.status !== 'question') return;
+  if (room.status !== 'question') return { error: 'Сейчас нет активного вопроса' };
+  if (room.transitioning) return { error: 'Результаты уже сохраняются' };
+  room.transitioning = true;
+
+  try {
+    return await commitReveal(io, room);
+  } finally {
+    // A programming error or a failed DB call must never leave the room locked.
+    room.transitioning = false;
+  }
+}
+
+async function commitReveal(io, room) {
   if (room.timer) {
     clearTimeout(room.timer);
     room.timer = null;
   }
-  room.status = 'reveal';
-  const q = room.currentQuestion;
-  const correctIds = q.options.filter((o) => o.isCorrect).map((o) => o.id);
 
-  // Persist this question's answers and bump participant scores.
+  const question = room.currentQuestion;
+  const nextScores = new Map(
+    [...room.participants.values()].map((participant) => [
+      participant.id,
+      participant.score + (room.answers.get(participant.id)?.score || 0),
+    ])
+  );
   const writes = [];
-  for (const [participantId, ans] of room.answers.entries()) {
-    const participant = room.participants.get(participantId);
-    if (participant) participant.score += ans.score;
+
+  for (const [participantId, answer] of room.answers.entries()) {
     writes.push(
       prisma.participantAnswer.upsert({
         where: {
           sessionId_questionId_participantId: {
             sessionId: room.sessionId,
-            questionId: q.id,
+            questionId: question.id,
             participantId,
           },
         },
         create: {
           sessionId: room.sessionId,
-          questionId: q.id,
+          questionId: question.id,
           participantId,
-          selectedOptionIds: JSON.stringify(ans.optionIds),
-          isCorrect: ans.correct,
-          scoreAwarded: ans.score,
+          selectedOptionIds: JSON.stringify(answer.optionIds),
+          isCorrect: answer.correct,
+          scoreAwarded: answer.score,
         },
         update: {
-          selectedOptionIds: JSON.stringify(ans.optionIds),
-          isCorrect: ans.correct,
-          scoreAwarded: ans.score,
+          selectedOptionIds: JSON.stringify(answer.optionIds),
+          isCorrect: answer.correct,
+          scoreAwarded: answer.score,
+          answeredAt: new Date(),
         },
       })
     );
   }
-  // Persist updated cumulative scores.
-  for (const p of room.participants.values()) {
+  for (const [participantId, score] of nextScores.entries()) {
     writes.push(
-      prisma.sessionParticipant.update({
-        where: { id: p.id },
-        data: { score: p.score },
-      })
+      prisma.sessionParticipant.update({ where: { id: participantId }, data: { score } })
     );
   }
+
   try {
     await prisma.$transaction(writes);
-  } catch {
-    // Persistence failures shouldn't break the live flow; results stay in memory.
+  } catch (error) {
+    console.error(`Could not persist reveal for room ${room.roomCode}:`, error);
+    const message = 'Не удалось сохранить результаты. Ведущий может повторить операцию.';
+    io.to(room.roomCode).emit('game:error', { message, recoverable: true });
+    return { error: message };
   }
 
+  for (const participant of room.participants.values()) {
+    participant.score = nextScores.get(participant.id);
+  }
+  room.status = 'reveal';
+
+  const correctOptionIds = question.options
+    .filter((option) => option.isCorrect)
+    .map((option) => option.id);
   const revealPayload = {
-    questionId: q.id,
-    correctOptionIds: correctIds,
+    questionId: question.id,
+    correctOptionIds,
     leaderboard: leaderboard(room),
     isLast: room.currentIndex + 1 >= room.quiz.questions.length,
   };
-  room.lastReveal = revealPayload; // cached so mid-reveal reconnects can sync
+  room.lastReveal = revealPayload;
   io.to(room.roomCode).emit('question:reveal', revealPayload);
 
-  // Tell each participant whether they were right this round.
-  for (const [participantId, ans] of room.answers.entries()) {
-    const p = room.participants.get(participantId);
-    if (p?.connected) {
-      io.to(p.socketId).emit('question:result', {
-        correct: ans.correct,
-        scoreAwarded: ans.score,
-        totalScore: p.score,
+  for (const [participantId, answer] of room.answers.entries()) {
+    const participant = room.participants.get(participantId);
+    if (participant?.connected && participant.socketId) {
+      io.to(participant.socketId).emit('question:result', {
+        correct: answer.correct,
+        scoreAwarded: answer.score,
+        totalScore: participant.score,
       });
     }
   }
+  return { ok: true };
 }
 
 async function finishQuiz(io, room) {
+  if (room.transitioning) return { error: 'Предыдущая операция ещё выполняется' };
+  room.transitioning = true;
+  try {
+    await prisma.quizSession.update({
+      where: { id: room.sessionId },
+      data: { status: 'finished', finishedAt: new Date() },
+    });
+  } catch (error) {
+    console.error(`Could not finish room ${room.roomCode}:`, error);
+    const message = 'Не удалось сохранить завершение квиза. Повторите операцию.';
+    io.to(room.roomCode).emit('game:error', { message, recoverable: true });
+    return { error: message };
+  } finally {
+    room.transitioning = false;
+  }
+
   if (room.timer) clearTimeout(room.timer);
   room.status = 'finished';
-  await prisma.quizSession.update({
-    where: { id: room.sessionId },
-    data: { status: 'finished', finishedAt: new Date() },
-  });
   io.to(room.roomCode).emit('quiz:finish', { leaderboard: leaderboard(room) });
-  // Keep the room briefly so late reveals/leaderboard fetches resolve, then drop.
-  setTimeout(() => liveRooms.delete(room.roomCode), 60_000);
+  room.cleanupTimer = setTimeout(() => liveRooms.delete(room.roomCode), 60_000);
+  room.cleanupTimer.unref?.();
+  return { ok: true };
+}
+
+export async function shutdownLiveRooms(io) {
+  const activeSessionIds = [];
+  for (const room of liveRooms.values()) {
+    if (room.timer) clearTimeout(room.timer);
+    if (room.cleanupTimer) clearTimeout(room.cleanupTimer);
+    io.to(room.roomCode).emit('server:shutdown', {
+      message: 'Сервер перезапускается. Активная игра завершена.',
+    });
+    if (room.status !== 'finished' && room.status !== 'lobby') {
+      activeSessionIds.push(room.sessionId);
+    }
+  }
+  if (activeSessionIds.length > 0) {
+    await prisma.quizSession.updateMany({
+      where: { id: { in: activeSessionIds }, status: 'active' },
+      data: { status: 'finished', finishedAt: new Date() },
+    });
+  }
+  io.disconnectSockets(true);
+  liveRooms.clear();
 }

@@ -3,8 +3,8 @@ dist/
 .env
 *.log
 .DS_Store
-server/prisma/dev.db
-server/prisma/dev.db-journal
+server/prisma/*.db
+server/prisma/*.db-journal
 server/uploads/*
 !server/uploads/.gitkeep
 design/

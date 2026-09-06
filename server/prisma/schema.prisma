@@ -87,6 +87,10 @@ model SessionParticipant {
   session QuizSession         @relation(fields: [sessionId], references: [id], onDelete: Cascade)
   user    User?               @relation(fields: [userId], references: [id], onDelete: SetNull)
   answers ParticipantAnswer[]
+
+  // SQLite permits multiple NULL values, so guests remain unrestricted while
+  // an authenticated user is idempotent within one session.
+  @@unique([sessionId, userId])
 }
 
 model ParticipantAnswer {

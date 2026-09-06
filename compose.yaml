@@ -1,0 +1,20 @@
+services:
+  quiz:
+    build: .
+    ports:
+      - "4000:4000"
+    environment:
+      DATABASE_URL: file:/data/quiz.db
+      CLIENT_ORIGIN: http://localhost:4000
+      JWT_ACCESS_SECRET: local-compose-access-secret-change-before-deploying
+      JWT_REFRESH_SECRET: local-compose-refresh-secret-change-before-deploying
+      SEED_DEMO_DATA: "true"
+    volumes:
+      - quiz-data:/data
+      - quiz-uploads:/app/server/uploads
+    init: true
+    restart: unless-stopped
+
+volumes:
+  quiz-data:
+  quiz-uploads:

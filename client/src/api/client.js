@@ -1,4 +1,6 @@
-export const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000';
+// An explicitly empty VITE_API_URL means same-origin (the Docker image serves
+// the built SPA and API together). Local development uses the example value.
+export const API_URL = (import.meta.env.VITE_API_URL ?? 'http://localhost:4000').replace(/\/$/, '');
 
 const ACCESS_KEY = 'quiz_access';
 const REFRESH_KEY = 'quiz_refresh';
@@ -48,6 +50,18 @@ function refreshAccessToken() {
     refreshPromise = null;
   });
   return refreshPromise;
+}
+
+// Socket handshakes cannot transparently replay through the REST helper. This
+// check refreshes an expired access token first and returns the current value.
+export async function getSocketAccessToken() {
+  if (!tokenStore.access) return null;
+  try {
+    await api('/api/auth/me');
+    return tokenStore.access;
+  } catch {
+    return null;
+  }
 }
 
 // Forces a logout when the session can no longer be refreshed. AuthProvider

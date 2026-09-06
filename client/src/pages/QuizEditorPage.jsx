@@ -49,8 +49,13 @@ export default function QuizEditorPage() {
 
   async function deleteQuestion(qid) {
     if (!confirm('Удалить вопрос?')) return;
-    await api(`/api/quizzes/${id}/questions/${qid}`, { method: 'DELETE' });
-    load();
+    setError('');
+    try {
+      await api(`/api/quizzes/${id}/questions/${qid}`, { method: 'DELETE' });
+      await load();
+    } catch (err) {
+      setError(err.message);
+    }
   }
 
   async function move(index, dir) {
@@ -58,8 +63,13 @@ export default function QuizEditorPage() {
     if (target < 0 || target >= quiz.questions.length) return;
     const order = quiz.questions.map((q) => q.id);
     [order[index], order[target]] = [order[target], order[index]];
-    await api(`/api/quizzes/${id}/questions-order`, { method: 'PUT', body: { order } });
-    load();
+    setError('');
+    try {
+      await api(`/api/quizzes/${id}/questions-order`, { method: 'PUT', body: { order } });
+      await load();
+    } catch (err) {
+      setError(err.message);
+    }
   }
 
   async function launch() {

@@ -9,6 +9,7 @@ const log = (...a) => console.log('•', ...a);
 const fail = (m) => { console.error('✗ FAIL:', m); process.exit(1); };
 const ack = (s, ev, p) => new Promise((r) => s.emit(ev, p, (x) => r(x || {})));
 const conn = () => { const s = io(API, { transports: ['websocket'] }); return new Promise((r) => s.on('connect', () => r(s))); };
+const once = (socket, event) => new Promise((resolve) => socket.once(event, resolve));
 
 async function login(email, password) {
   const r = await fetch(`${API}/api/auth/login`, {
@@ -56,11 +57,13 @@ async function main() {
 
   // 3. Real owner reconnects with the correct id + token → same participant.
   const victim2 = await conn();
+  const victimReplaced = once(victim, 'session:replaced');
   const vr = await ack(victim2, 'room:join', {
     roomCode: session.roomCode, nickname: 'Жертва',
     participantId: vj.participantId, rejoinToken: vj.rejoinToken,
   });
   if (vr.participantId !== vj.participantId) fail('owner reconnect should reuse participantId');
+  await victimReplaced;
   log('owner reconnect works via rejoinToken');
 
   // 4. Authenticated participant dedup: join twice with only the token (no id).
@@ -69,9 +72,20 @@ async function main() {
   const pc1 = await conn();
   const p1 = await ack(pc1, 'room:join', { roomCode: session.roomCode, nickname: 'Игрок', token: part.accessToken });
   const pc2 = await conn();
+  const firstSocketReplaced = once(pc1, 'session:replaced');
   const p2 = await ack(pc2, 'room:join', { roomCode: session.roomCode, nickname: 'Игрок', token: part.accessToken });
   if (p1.participantId !== p2.participantId) fail('authed participant duplicated across joins');
+  await firstSocketReplaced;
   log('authenticated participant de-duplicated across rejoin');
+
+  // 5. The replaced connection must no longer be authorized to answer.
+  const shown = once(pc2, 'question:show');
+  const started = await ack(orgSock, 'quiz:start', {});
+  if (started.error) fail('start for stale-socket check: ' + started.error);
+  const question = await shown;
+  const stale = await ack(pc1, 'question:answer', { optionIds: [question.options[0].id] });
+  if (!stale.error) fail('replaced socket should not be allowed to answer');
+  log('replaced socket loses answer permissions');
 
   console.log('\n✓ SECURITY CHECKS PASSED');
   process.exit(0);

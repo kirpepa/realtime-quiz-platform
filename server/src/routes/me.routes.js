@@ -1,12 +1,13 @@
 import { Router } from 'express';
 import { prisma } from '../db.js';
 import { requireAuth } from '../auth/middleware.js';
+import { asyncHandler } from '../lib/http.js';
 
 const router = Router();
 router.use(requireAuth);
 
 // GET /api/me/sessions — organizer history: sessions of the user's quizzes.
-router.get('/sessions', async (req, res) => {
+router.get('/sessions', asyncHandler(async (req, res) => {
   const sessions = await prisma.quizSession.findMany({
     where: { quiz: { ownerId: req.user.id } },
     orderBy: { createdAt: 'desc' },
@@ -20,10 +21,10 @@ router.get('/sessions', async (req, res) => {
     },
   });
   res.json({ sessions });
-});
+}));
 
 // GET /api/me/participations — participant history: sessions the user joined.
-router.get('/participations', async (req, res) => {
+router.get('/participations', asyncHandler(async (req, res) => {
   const participations = await prisma.sessionParticipant.findMany({
     where: { userId: req.user.id },
     orderBy: { joinedAt: 'desc' },
@@ -60,6 +61,6 @@ router.get('/participations', async (req, res) => {
     };
   });
   res.json({ participations: result });
-});
+}));
 
 export default router;

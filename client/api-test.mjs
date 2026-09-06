@@ -88,6 +88,17 @@ async function main() {
   if (served.status !== 200) fail('uploaded image not served');
   log('image upload works and file is served');
 
+  // A forged browser MIME must not turn arbitrary bytes into a public file.
+  const forged = new FormData();
+  forged.append('image', new Blob(['not really a png'], { type: 'image/png' }), 'fake.png');
+  const forgedUpload = await fetch(`${API}/api/quizzes/upload`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${orgToken}` },
+    body: forged,
+  });
+  if (forgedUpload.status !== 415) fail('forged image MIME should be rejected with 415');
+  log('upload signature validation rejects forged MIME (415)');
+
   // --- add image + multiple-choice question ---
   r = await j(`/api/quizzes/${quizId}/questions`, {
     method: 'POST',

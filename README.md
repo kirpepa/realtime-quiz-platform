@@ -1,139 +1,156 @@
-# VK Квиз — веб-приложение для проведения квизов в реальном времени
+# VK Quiz
 
-MVP приложения в духе Kahoot, оформленное в фирменном стиле VK. Организатор
-создаёт квиз, запускает комнату и ведёт игру; участники подключаются по коду и
-отвечают на вопросы в реальном времени. Баллы считаются с учётом скорости,
-победители определяются на живом лидерборде.
+[![CI](https://github.com/kirpepa/realtime-quiz-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/kirpepa/realtime-quiz-platform/actions/workflows/ci.yml)
 
-## Возможности
+Full-stack платформа для проведения квизов в реальном времени. Организатор
+собирает квиз и управляет ходом игры, участники входят по короткому коду, а
+сервер синхронно показывает вопросы, принимает ответы и строит лидерборд.
 
-- **Роли**: организатор и участник. Участник может играть с аккаунтом или как
-  гость (по нику + коду комнаты); история сохраняется только для
-  зарегистрированных.
-- **Аутентификация**: email + пароль (bcrypt), JWT access/refresh токены,
-  защита приватных роутов middleware, тихое продление сессии по refresh-токену.
-- **Редактор квизов**: настройки (категория, время на вопрос, разрешение смены
-  ответа, бонус за скорость); вопросы текстовые и с изображением; одиночный и
-  множественный выбор; 2–6 вариантов; изменение порядка вопросов; загрузка
-  изображений.
-- **Реальное время (Socket.IO)**: комнаты по коду, синхронная трансляция
-  вопросов, **серверный таймер как источник истины**, приём ответов только во
-  время показа вопроса, авто-показ ответа по таймауту или когда ответили все.
-- **Подсчёт баллов и лидерборд**: базовые баллы + бонус за скорость,
-  промежуточный лидерборд после каждого вопроса, финальный лидерборд,
-  сохранение результатов в БД.
-- **Личный кабинет**: у организатора — список квизов и история проведённых
-  сессий; у участника — история участия с местами и баллами.
-- **Устойчивость к обрывам связи**: участник восстанавливает состояние в комнате
-  после переподключения (личность подтверждается секретным `rejoinToken`,
-  участник и его баллы сохраняются).
+Это не статическая демонстрация интерфейса: основной сценарий проходит через
+REST API, Socket.IO и транзакционное сохранение результатов в SQLite.
 
-## Стек и обоснование
+## Что реализовано
 
-| Слой        | Технология                                    |
-|-------------|-----------------------------------------------|
-| Frontend    | React 18 + Vite, React Router, Tailwind CSS   |
-| Realtime    | Socket.IO (client + server)                   |
-| Backend     | Node.js + Express                             |
-| БД / ORM    | SQLite + Prisma (легко заменить на PostgreSQL) |
-| Auth        | JWT (access/refresh), bcrypt                  |
+- роли организатора и участника, гостевой вход в игру;
+- access/refresh JWT, автоматическое обновление access-токена и guards по роли и владельцу;
+- редактор квизов: одиночный/множественный выбор, индивидуальный таймер,
+  изображения, порядок вопросов и правила начисления баллов;
+- серверный дедлайн как источник истины: клиентский таймер не определяет,
+  успел ли игрок ответить;
+- live-прогресс, reveal правильного ответа и лидерборд после каждого вопроса;
+- восстановление игрока после обрыва по `rejoinToken` или authenticated user id;
+- защита от захвата чужого `participantId` и от двух активных socket-соединений
+  одной игровой личности;
+- атомарная запись ответа и накопленного счёта перед публикацией reveal;
+- история проведённых игр и участий.
 
-Подробное обоснование выбора средств — в [docs/NOTES.md](docs/NOTES.md).
+## Архитектура
 
-## Структура репозитория
-
-```
-/server   — Express API + Socket.IO + Prisma (модели, миграции), загрузки
-/client   — React/Vite приложение + тестовые скрипты
-/docs      — пояснительная записка, схема БД, архитектура
+```mermaid
+flowchart LR
+  UI[React SPA] -->|JWT REST| API[Express API]
+  UI <-->|Socket.IO| RT[Realtime session manager]
+  API --> DB[(SQLite / Prisma)]
+  RT -->|transaction on reveal| DB
+  API --> UP[(Validated image storage)]
 ```
 
-## Быстрый старт
+| Слой | Технологии |
+|---|---|
+| Frontend | React 18, React Router 7, Vite 7, Tailwind CSS |
+| API | Node.js 22, Express 5, Prisma ORM |
+| Realtime | Socket.IO, rooms, ack + timeout, reconnect/resync |
+| Data | SQLite, Prisma migrations and transactions |
+| Security | bcrypt, typed JWT, Helmet, CORS, REST/socket rate limits |
+| Delivery | Docker multi-stage build, health checks, graceful shutdown, GitHub Actions |
 
-Требуется Node.js 18+ (проверено на Node 26).
+Состояние активного вопроса хранится в памяти одного процесса; ответы и баллы
+фиксируются в БД перед событием `question:reveal`. Поэтому текущая версия
+рассчитана на один экземпляр приложения. Для горизонтального масштабирования
+понадобятся PostgreSQL, общий state store и Socket.IO Redis adapter.
 
-### 1. Установка зависимостей
+Подробности: [архитектура](docs/ARCHITECTURE.md), [модель данных](docs/DATABASE.md),
+[диаграммы](docs/DIAGRAMS.md).
+
+## Локальный запуск
+
+Нужны Node.js 22.12+ и npm 10+.
 
 ```bash
 npm run install:all
-# или вручную:
-#   npm install --prefix server
-#   npm install --prefix client
+cp server/.env.example server/.env
+npm run setup:server
 ```
 
-### 2. Настройка сервера (миграции + демо-данные)
+Затем в двух терминалах:
 
 ```bash
-cp server/.env.example server/.env        # секреты для локали уже заданы
-npm run prisma:migrate --prefix server    # создаёт SQLite-базу и таблицы
-npm run seed --prefix server              # демо-организатор + готовый квиз
-```
-
-Демо-аккаунт организатора: **demo@quiz.dev** / **password123**.
-
-### 3. Запуск (в двух терминалах)
-
-```bash
-# терминал 1 — API + WebSocket на http://localhost:4000
 npm run dev:server
-
-# терминал 2 — клиент на http://localhost:5173
 npm run dev:client
 ```
 
-Откройте <http://localhost:5173>.
+Интерфейс: <http://localhost:5173>. API и Socket.IO: <http://localhost:4000>.
 
-## Сквозной сценарий (как попробовать)
+После seed доступен демонстрационный организатор:
+`demo@quiz.dev` / `password123`.
 
-1. Войдите как организатор (demo@quiz.dev / password123).
-2. В кабинете нажмите «Запустить» у демо-квиза → откроется панель ведущего с
-   **кодом комнаты**.
-3. В другом окне/на другом устройстве откройте главную или `/join`, введите код
-   и имя — присоединитесь как участник (можно открыть несколько вкладок).
-4. На панели ведущего нажмите «Начать квиз» и ведите его кнопками «Показать
-   ответ» / «Следующий вопрос».
-5. По окончании все видят финальный лидерборд; результаты попадают в историю
-   кабинетов.
-
-## Тестирование
-
-В папке `client/` лежат автоматические проверки (запускать при работающем
-сервере `npm run dev:server` и заполненной демо-базе):
+JWT-секретов по умолчанию нет: вне `NODE_ENV=test` сервер завершит запуск, если
+они отсутствуют или короче 32 байт. Для production создайте два разных секрета:
 
 ```bash
-npm run test:api      --prefix client   # REST: роли, CRUD, валидация, загрузка, история
-npm run test:e2e      --prefix client   # realtime: сессия, таймер, баллы, лидерборд, БД
-npm run test:security --prefix client   # защита личности участника (rejoinToken, dedup)
+openssl rand -hex 32
+openssl rand -hex 32
 ```
+
+## Docker
+
+```bash
+docker compose up --build
+```
+
+Приложение будет доступно на <http://localhost:4000>. Compose-файл содержит
+только локальные демонстрационные секреты; перед реальным развёртыванием их
+нужно заменить. Данные и изображения сохраняются в named volumes.
+
+Проверки оркестратора:
+
+- liveness: `GET /api/health`;
+- readiness с запросом к БД: `GET /api/health/ready`;
+- `SIGTERM`/`SIGINT`: сервер перестаёт принимать соединения, закрывает игровые
+  комнаты и отключается от Prisma в пределах заданного таймаута.
+
+## Проверки
+
+```bash
+npm test --prefix server          # node:test: scoring, JWT, config, file signatures
+npm run build --prefix client     # production frontend build
+npm run audit                     # server + client dependency audit
+```
+
+Интеграционные сценарии запускаются против подготовленного работающего сервера:
+
+```bash
+npm run test:api --prefix client
+npm run test:security --prefix client
+npm run test:e2e --prefix client
+```
+
+GitHub Actions на каждый pull request устанавливает зависимости через
+`npm ci`, запускает unit-тесты, production build, dependency audit, применяет
+миграции и проверяет REST + realtime сценарий с несколькими Socket.IO-клиентами.
+
+## Защитные меры
+
+- JWT принимает только HS256, проверяет issuer, audience и тип токена;
+- refresh-токен нельзя использовать как access-токен;
+- лимиты тела запроса и частоты запросов; отдельный лимит upload/auth;
+- изображения ограничены 5 МБ, проверяются и по MIME, и по magic bytes, получают
+  случайное серверное имя и отдаются с `nosniff`;
+- correct-answer flags не отправляются клиенту до reveal;
+- неизвестные option ids, поздние ответы и ответы от заменённого socket отвергаются;
+- ошибки БД не проглатываются: reveal/finish не меняют публичную фазу до успешной
+  записи, ведущий получает восстанавливаемую ошибку и может повторить действие.
 
 ## Переменные окружения
 
-`server/.env`:
+| Переменная | Назначение |
+|---|---|
+| `DATABASE_URL` | URL SQLite, например `file:./dev.db` |
+| `JWT_ACCESS_SECRET` | обязательный уникальный секрет, минимум 32 байта |
+| `JWT_REFRESH_SECRET` | обязательный отдельный секрет, минимум 32 байта |
+| `ACCESS_TOKEN_TTL` | TTL access-токена, по умолчанию `15m` |
+| `REFRESH_TOKEN_TTL` | TTL refresh-токена, по умолчанию `7d` |
+| `CLIENT_ORIGIN` | разрешённые origins через запятую |
+| `TRUST_PROXY` | `true` только за доверенным reverse proxy |
+| `MAX_PARTICIPANTS_PER_ROOM` | лимит игроков, по умолчанию `200` |
+| `SHUTDOWN_TIMEOUT_MS` | предел graceful shutdown, по умолчанию `10000` |
+| `VITE_API_URL` | адрес API для frontend; пустая строка означает same-origin |
 
-| Переменная           | Назначение                                       |
-|----------------------|--------------------------------------------------|
-| `DATABASE_URL`       | строка подключения (по умолч. `file:./dev.db`)   |
-| `JWT_ACCESS_SECRET`  | секрет access-токена                             |
-| `JWT_REFRESH_SECRET` | секрет refresh-токена                            |
-| `ACCESS_TOKEN_TTL`   | срок жизни access-токена (по умолч. 15m)         |
-| `REFRESH_TOKEN_TTL`  | срок жизни refresh-токена (по умолч. 7d)         |
-| `PORT`               | порт сервера (4000)                              |
-| `CLIENT_ORIGIN`      | origin клиента для CORS (5173)                   |
+## Осознанные ограничения
 
-`client/.env`:
+- SQLite и in-memory room state означают один replica/process;
+- refresh-токены stateless: нет server-side отзыва отдельных сессий;
+- изображения лежат на локальном volume, без object storage и антивирусного сканирования.
 
-| Переменная      | Назначение                                    |
-|-----------------|-----------------------------------------------|
-| `VITE_API_URL`  | URL API + Socket.IO (`http://localhost:4000`) |
-
-## Документация
-
-- [docs/NOTES.md](docs/NOTES.md) — пояснительная записка (обоснование стека, этапы, соответствие ТЗ).
-- [docs/DATABASE.md](docs/DATABASE.md) — модель базы данных.
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — архитектура и протокол WebSocket.
-
-## Ссылки
-
-- **Макеты Miro:** https://miro.com/welcomeonboard/WFc5WkoxQ1RkQkVyamlZZDBYaVNDdFArRCt1Yjl4dkprMkxuQUZUdTRlTTFkZXJxTU1DNG54bDlGanhKc3B1a1R0SWQrU3ZCNXp4a0drNFBnNFFXdThXcEE2T3NrTkUzaHVneTlueWdKeHlZT1lqd25ncElHL0tYVjNwa1pCT2xzVXVvMm53MW9OWFg5bkJoVXZxdFhRPT0hdjE=?share_link_id=263147961371
-- **Макеты Figma:** https://www.figma.com/design/40LbCeOR19dk3cJfJys6kg/Untitled?node-id=0-1&t=AOmiBWWzPC4tE8vd-1
-- **Репозиторий:** https://github.com/kirpepa/VK_qwiz
+Эти ограничения сохранены явно, чтобы проект не обещал свойства, которых у
+текущей реализации нет.

@@ -42,20 +42,27 @@ export default function RegisterPage() {
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
             <label className="label">Никнейм</label>
-            <input className="input" value={form.nickname} onChange={update('nickname')} required />
+            <input
+              className="input"
+              value={form.nickname}
+              onChange={update('nickname')}
+              maxLength={40}
+              required
+            />
           </div>
           <div>
             <label className="label">Email</label>
             <input type="email" className="input" value={form.email} onChange={update('email')} required />
           </div>
           <div>
-            <label className="label">Пароль (мин. 6 символов)</label>
+            <label className="label">Пароль (мин. 8 символов)</label>
             <input
               type="password"
               className="input"
               value={form.password}
               onChange={update('password')}
-              minLength={6}
+              minLength={8}
+              maxLength={72}
               required
             />
           </div>

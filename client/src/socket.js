@@ -7,7 +7,13 @@ let socket = null;
 
 export function getSocket() {
   if (!socket) {
-    socket = io(API_URL, { autoConnect: true, transports: ['websocket', 'polling'] });
+    socket = io(API_URL || undefined, {
+      autoConnect: true,
+      transports: ['websocket', 'polling'],
+      reconnectionDelay: 500,
+      reconnectionDelayMax: 5_000,
+      randomizationFactor: 0.4,
+    });
   }
   return socket;
 }
@@ -15,6 +21,18 @@ export function getSocket() {
 // Promisified emit for request/response style events with an ack callback.
 export function emitAck(event, payload) {
   return new Promise((resolve) => {
-    getSocket().emit(event, payload, (response) => resolve(response || {}));
+    const activeSocket = getSocket();
+    if (!activeSocket.connected) {
+      activeSocket.connect();
+      resolve({ error: 'Нет соединения с сервером. Переподключаемся…' });
+      return;
+    }
+    activeSocket.timeout(8_000).emit(event, payload, (error, response) => {
+      if (error) {
+        resolve({ error: 'Сервер не ответил вовремя. Проверьте соединение.' });
+        return;
+      }
+      resolve(response || {});
+    });
   });
 }

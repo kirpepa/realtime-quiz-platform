@@ -2,11 +2,12 @@ import { Router } from 'express';
 import { prisma } from '../db.js';
 import { requireAuth, requireRole } from '../auth/middleware.js';
 import { generateRoomCode } from '../lib/roomCode.js';
+import { asyncHandler } from '../lib/http.js';
 
 const router = Router();
 
 // POST /api/sessions — organizer creates a live session (room) for a quiz.
-router.post('/', requireAuth, requireRole('organizer'), async (req, res) => {
+router.post('/', requireAuth, requireRole('organizer'), asyncHandler(async (req, res) => {
   const { quizId } = req.body || {};
   const quiz = await prisma.quiz.findUnique({
     where: { id: quizId },
@@ -20,31 +21,35 @@ router.post('/', requireAuth, requireRole('organizer'), async (req, res) => {
     return res.status(400).json({ error: 'Нельзя запустить квиз без вопросов' });
   }
 
-  // Generate a unique room code (retry on the rare collision).
-  let roomCode = null;
+  // The unique index is the final authority. Retrying the create itself avoids
+  // a check-then-insert race when two sessions are opened concurrently.
+  let session = null;
   for (let i = 0; i < 8; i += 1) {
-    const candidate = generateRoomCode();
-    const clash = await prisma.quizSession.findUnique({ where: { roomCode: candidate } });
-    if (!clash) {
-      roomCode = candidate;
+    try {
+      session = await prisma.quizSession.create({
+        data: { quizId: quiz.id, roomCode: generateRoomCode(), status: 'pending' },
+      });
       break;
+    } catch (error) {
+      if (error?.code !== 'P2002') throw error;
     }
   }
-  if (!roomCode) {
+  if (!session) {
     return res.status(503).json({ error: 'Не удалось сгенерировать код комнаты, попробуйте ещё раз' });
   }
 
-  const session = await prisma.quizSession.create({
-    data: { quizId: quiz.id, roomCode, status: 'pending' },
-  });
   res.status(201).json({ session });
-});
+}));
 
 // GET /api/sessions/room/:code — public lookup so participants can validate a
 // room code before attempting to join over WebSocket.
-router.get('/room/:code', async (req, res) => {
+router.get('/room/:code', asyncHandler(async (req, res) => {
+  const code = typeof req.params.code === 'string' ? req.params.code.toUpperCase() : '';
+  if (!/^[A-HJ-NP-Z2-9]{6}$/.test(code)) {
+    return res.status(400).json({ error: 'Некорректный код комнаты' });
+  }
   const session = await prisma.quizSession.findUnique({
-    where: { roomCode: req.params.code.toUpperCase() },
+    where: { roomCode: code },
     include: { quiz: { select: { title: true, category: true } } },
   });
   if (!session) return res.status(404).json({ error: 'Комната не найдена' });
@@ -56,6 +61,6 @@ router.get('/room/:code', async (req, res) => {
       category: session.quiz.category,
     },
   });
-});
+}));
 
 export default router;

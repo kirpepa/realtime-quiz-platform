@@ -1,0 +1,9 @@
+.git
+.github
+**/node_modules
+**/dist
+**/.env
+**/*.log
+server/prisma/*.db*
+server/uploads/*
+!server/uploads/.gitkeep
